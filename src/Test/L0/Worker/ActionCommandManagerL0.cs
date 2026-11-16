@@ -443,6 +443,84 @@ namespace GitHub.Runner.Common.Tests.Worker
             }
         }
 
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void AddMaskWithMultilineValueMasksTrimmedLines()
+        {
+            using (TestHostContext hc = CreateTestContext())
+            {
+                var first = Guid.NewGuid().ToString("N");
+                var second = Guid.NewGuid().ToString("N");
+
+                // Indented multiline values (e.g. YAML block scalars) are printed line by line.
+                _commandManager.TryProcessCommand(_ec.Object, $"::add-mask::  {first} %0A\t{second}\t", null);
+
+                Assert.Equal("***", hc.SecretMasker.MaskSecrets(first));
+                Assert.Equal("***", hc.SecretMasker.MaskSecrets(second));
+            }
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void AddMaskDoesNotEchoUnregisteredValue(bool legacyCommand)
+        {
+            using (TestHostContext hc = CreateTestContext())
+            {
+                var secret = Guid.NewGuid().ToString("N");
+                var command = legacyCommand ? $"##[add-mask]{secret}" : $"::add-mask::{secret}";
+                var output = new List<string>();
+                _ec.Object.EchoOnActionCommand = true;
+                _ec.Setup(x => x.Write(It.IsAny<string>(), It.IsAny<string>()))
+                    .Callback((string tag, string message) => output.Add(message));
+
+                Assert.Equal(secret, hc.SecretMasker.MaskSecrets(secret));
+                Assert.True(_commandManager.TryProcessCommand(_ec.Object, command, null));
+
+                // Capture writes before downstream masking can hide an unsafe echo.
+                Assert.Equal(new[] { "::add-mask::***" }, output);
+                Assert.Equal("***", hc.SecretMasker.MaskSecrets(secret));
+            }
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public void AddMaskDoesNotIncludeUnregisteredValueInFailure(bool echo)
+        {
+            using (TestHostContext hc = CreateTestContext())
+            {
+                var secret = Guid.NewGuid().ToString("N");
+                var output = new List<string>();
+                var errors = new List<string>();
+                _ec.Object.EchoOnActionCommand = echo;
+                _ec.Setup(x => x.Write(It.IsAny<string>(), It.IsAny<string>()))
+                    .Callback((string tag, string message) => output.Add(message));
+                _ec.Setup(x => x.AddIssue(It.IsAny<Issue>(), It.IsAny<ExecutionContextLogOptions>()))
+                    .Callback((Issue issue, ExecutionContextLogOptions options) => errors.Add(issue.Message));
+
+                // Fail before registration with safe exception text. Only the command
+                // manager's own diagnostic is under test, not arbitrary exception data.
+                hc.SecretMasker.AddValueEncoder(value => throw new InvalidOperationException("Synthetic encoder failure"));
+
+                Assert.True(_commandManager.TryProcessCommand(_ec.Object, $"::add-mask::{secret}", null));
+
+                Assert.Equal(echo ? new[] { "::add-mask::***" } : Array.Empty<string>(), output);
+                Assert.Equal(new[]
+                {
+                    "Unable to process command 'add-mask' successfully.",
+                    "Synthetic encoder failure"
+                }, errors);
+                Assert.Equal(TaskResult.Failed, _ec.Object.CommandResult);
+                Assert.Equal(secret, hc.SecretMasker.MaskSecrets(secret));
+            }
+        }
+
         private TestHostContext CreateTestContext([CallerMemberName] string testName = "")
         {
             var hostContext = new TestHostContext(this, testName);
